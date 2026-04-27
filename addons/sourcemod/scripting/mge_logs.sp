@@ -4,6 +4,7 @@
 #include <sourcemod>
 #include <tf2_stocks>
 #include <mge>
+#include <ripext>
 
 #define PLUGIN_VERSION "0.1.0"
 
@@ -12,6 +13,8 @@
 #define MAX_STEAMID_LEN 32
 #define MAX_LOG_LINE_LEN 768
 #define MATCH_ID_LEN 17
+#define MAX_UPLOAD_LOG_SIZE (512 * 1024)
+#define MAX_LAST_LOG_URL_LEN 256
 
 static const char g_sClassNames[10][] = {
 	"", "scout", "sniper", "soldier", "demoman",
@@ -28,6 +31,9 @@ public Plugin myinfo = {
 
 ConVar g_cvEnabled;
 ConVar g_cvMaxFiles;
+ConVar g_cvUpload;
+ConVar g_cvApiKey;
+ConVar g_cvUploadUrl;
 
 bool g_bGameLogHooked;
 bool g_bMGEAvailable;
@@ -49,10 +55,21 @@ int g_iSessionWinnerScore[MAX_ARENAS];
 int g_iSessionLoserScore[MAX_ARENAS];
 int g_iSession2v2WinningTeam[MAX_ARENAS];
 
+char g_sLastLogUrl[MAXPLAYERS + 1][MAX_LAST_LOG_URL_LEN];
+
+static char s_UploadLogBuf[MAX_UPLOAD_LOG_SIZE];
+
 public void OnPluginStart()
 {
-	g_cvEnabled  = CreateConVar("mge_logs_enabled",   "1",    "Master switch for match logging.", _, true, 0.0, true, 1.0);
-	g_cvMaxFiles = CreateConVar("mge_logs_max_files", "1000", "Max log files to keep in logs/mge/.", _, true, 0.0);
+	g_cvEnabled   = CreateConVar("mge_logs_enabled",    "1",  "Master switch for match logging.", _, true, 0.0, true, 1.0);
+	g_cvMaxFiles  = CreateConVar("mge_logs_max_files",  "1000", "Max log files to keep in logs/mge/.", _, true, 0.0);
+	g_cvUpload    = CreateConVar("mge_logs_upload",     "0",  "Upload completed logs to the mge.tf backend.", _, true, 0.0, true, 1.0);
+	g_cvApiKey    = CreateConVar("mge_logs_apikey",     "",   "API key for log upload.", FCVAR_PROTECTED);
+	g_cvUploadUrl = CreateConVar("mge_logs_upload_url", "",   "Full endpoint URL for log upload (e.g. https://mge.tf/api/logs/upload).");
+
+	RegConsoleCmd("sm_lastlog", Cmd_LastLog);
+	AddCommandListener(Listener_Say, "say");
+	AddCommandListener(Listener_Say, "say_team");
 
 	g_bMGEAvailable = LibraryExists("mge");
 	g_hSteamToArena = new StringMap();
@@ -95,6 +112,11 @@ public void OnLibraryRemoved(const char[] name)
 		g_bMGEAvailable = false;
 		DestroyAllSessions();
 	}
+}
+
+public void OnClientDisconnected(int client)
+{
+	g_sLastLogUrl[client][0] = '\0';
 }
 
 public void MGE_On1v1MatchStart(int arena_index, int player1, int player2)
@@ -213,7 +235,13 @@ public void Frame_FlushPendingSessions(int arena_index)
 				g_iSessionLoserScore[arena_index]);
 		}
 
-		FlushSession(arena_index);
+		char filePath[PLATFORM_MAX_PATH];
+		BuildPath(Path_SM, filePath, sizeof(filePath),
+			"logs/mge/mge_%s.log", g_sSessionMatchId[arena_index]);
+
+		if (FlushSession(arena_index)) {
+			UploadSession(arena_index, filePath);
+		}
 		DestroySession(arena_index);
 	}
 }
@@ -585,4 +613,235 @@ void EnsureLogDirectory()
 bool IsValidArenaIndex(int arena)
 {
 	return arena > 0 && arena < MAX_ARENAS;
+}
+
+bool ReadLogFile(const char[] path, char[] buffer, int maxlen)
+{
+	File f = OpenFile(path, "r");
+	if (f == null) {
+		return false;
+	}
+
+	int pos = 0;
+	char line[MAX_LOG_LINE_LEN];
+
+	while (!f.EndOfFile() && f.ReadLine(line, sizeof(line))) {
+		int lineLen = strlen(line);
+		if (pos + lineLen >= maxlen) {
+			f.Close();
+			LogError("[mge_logs] Log file too large to upload (>%d bytes): %s", maxlen, path);
+			return false;
+		}
+		strcopy(buffer[pos], maxlen - pos, line);
+		pos += lineLen;
+	}
+
+	buffer[pos] = '\0';
+	f.Close();
+	return true;
+}
+
+void UploadSession(int arena, const char[] filePath)
+{
+	if (!g_cvUpload.BoolValue || !LibraryExists("ripext")) {
+		return;
+	}
+
+	char apiKey[128], url[256];
+	g_cvApiKey.GetString(apiKey, sizeof(apiKey));
+	g_cvUploadUrl.GetString(url, sizeof(url));
+
+	if (apiKey[0] == '\0' || url[0] == '\0') {
+		return;
+	}
+
+	if (!ReadLogFile(filePath, s_UploadLogBuf, sizeof(s_UploadLogBuf))) {
+		return;
+	}
+
+	DataPack pack = new DataPack();
+	pack.WriteString(filePath);
+	pack.WriteString(apiKey);
+	pack.WriteString(url);
+	pack.WriteString(g_sSessionMatchId[arena]);
+	pack.WriteCell(g_iSessionPlayerCount[arena]);
+	for (int i = 0; i < g_iSessionPlayerCount[arena]; i++) {
+		pack.WriteString(g_sSessionPlayers[arena][i]);
+	}
+
+	JSONObject payload = new JSONObject();
+	payload.SetString("key", apiKey);
+	payload.SetString("matchid", g_sSessionMatchId[arena]);
+	payload.SetString("log", s_UploadLogBuf);
+
+	HTTPRequest request = new HTTPRequest(url);
+	request.Post(payload, Upload_Complete, pack);
+	delete payload;
+}
+
+void StoreUrlForSteamId(const char[] steamId, const char[] logUrl)
+{
+	for (int client = 1; client <= MaxClients; client++) {
+		if (!IsClientInGame(client)) {
+			continue;
+		}
+
+		char clientSteamId[MAX_STEAMID_LEN];
+		if (GetClientAuthId(client, AuthId_Steam3, clientSteamId, sizeof(clientSteamId))
+			&& StrEqual(clientSteamId, steamId))
+		{
+			strcopy(g_sLastLogUrl[client], MAX_LAST_LOG_URL_LEN, logUrl);
+		}
+	}
+}
+
+void DoStoreUrlFromPack(DataPack pack, const char[] logUrl)
+{
+	char skipBuf[PLATFORM_MAX_PATH];
+	char skipSmall[MATCH_ID_LEN];
+	pack.Reset();
+	pack.ReadString(skipBuf, sizeof(skipBuf));    // filePath
+	pack.ReadString(skipBuf, sizeof(skipBuf));    // apiKey
+	pack.ReadString(skipBuf, sizeof(skipBuf));    // uploadUrl
+	pack.ReadString(skipSmall, sizeof(skipSmall)); // matchId
+
+	int count = pack.ReadCell();
+	for (int i = 0; i < count; i++) {
+		char steamId[MAX_STEAMID_LEN];
+		pack.ReadString(steamId, sizeof(steamId));
+		StoreUrlForSteamId(steamId, logUrl);
+	}
+}
+
+public void Upload_Complete(HTTPResponse response, DataPack pack, const char[] error)
+{
+	if (response.Status != HTTPStatus_OK) {
+		LogError("[mge_logs] Upload failed (HTTP %d): %s", response.Status, error);
+		CreateTimer(5.0, Timer_RetryUpload, pack);
+		return;
+	}
+
+	JSONObject json = view_as<JSONObject>(response.Data);
+	char logUrl[MAX_LAST_LOG_URL_LEN];
+
+	if (!json.GetString("url", logUrl, sizeof(logUrl))) {
+		LogError("[mge_logs] Upload response missing 'url' field");
+		delete pack;
+		return;
+	}
+
+	DoStoreUrlFromPack(pack, logUrl);
+	delete pack;
+}
+
+public Action Timer_RetryUpload(Handle timer, DataPack pack)
+{
+	pack.Reset();
+	char filePath[PLATFORM_MAX_PATH], apiKey[128], url[256], matchId[MATCH_ID_LEN];
+	pack.ReadString(filePath, sizeof(filePath));
+	pack.ReadString(apiKey, sizeof(apiKey));
+	pack.ReadString(url, sizeof(url));
+	pack.ReadString(matchId, sizeof(matchId));
+
+	if (!ReadLogFile(filePath, s_UploadLogBuf, sizeof(s_UploadLogBuf))) {
+		LogError("[mge_logs] Retry upload: could not re-read log file %s", filePath);
+		delete pack;
+		return Plugin_Stop;
+	}
+
+	JSONObject payload = new JSONObject();
+	payload.SetString("key", apiKey);
+	payload.SetString("matchid", matchId);
+	payload.SetString("log", s_UploadLogBuf);
+
+	HTTPRequest request = new HTTPRequest(url);
+	request.Post(payload, Upload_RetryComplete, pack);
+	delete payload;
+
+	return Plugin_Stop;
+}
+
+public void Upload_RetryComplete(HTTPResponse response, DataPack pack, const char[] error)
+{
+	if (response.Status != HTTPStatus_OK) {
+		LogError("[mge_logs] Upload retry failed (HTTP %d): %s", response.Status, error);
+		delete pack;
+		return;
+	}
+
+	JSONObject json = view_as<JSONObject>(response.Data);
+	char logUrl[MAX_LAST_LOG_URL_LEN];
+
+	if (!json.GetString("url", logUrl, sizeof(logUrl))) {
+		LogError("[mge_logs] Upload retry response missing 'url' field");
+		delete pack;
+		return;
+	}
+
+	DoStoreUrlFromPack(pack, logUrl);
+	delete pack;
+}
+
+public Action Cmd_LastLog(int client, int args)
+{
+	if (client == 0) {
+		return Plugin_Handled;
+	}
+
+	ShowLastLog(client);
+	return Plugin_Handled;
+}
+
+public Action Listener_Say(int client, const char[] command, int argc)
+{
+	if (client == 0) {
+		return Plugin_Continue;
+	}
+
+	char text[32];
+	GetCmdArg(1, text, sizeof(text));
+
+	if (!StrEqual(text, "!lastlog") && !StrEqual(text, ".lastlog")) {
+		return Plugin_Continue;
+	}
+
+	ShowLastLog(client);
+
+	if (g_sLastLogUrl[client][0] != '\0') {
+		return Plugin_Handled;
+	}
+
+	return Plugin_Continue;
+}
+
+void ShowLastLog(int client)
+{
+	if (g_sLastLogUrl[client][0] == '\0') {
+		PrintToChat(client, "[MGE] No recent log found.");
+		return;
+	}
+
+	QueryClientConVar(client, "cl_disablehtmlmotd", QueryConVar_HtmlMotd, client);
+}
+
+public void QueryConVar_HtmlMotd(QueryCookie cookie, int client, ConVarQueryResult result, const char[] cvarName, const char[] cvarValue)
+{
+	if (!IsClientInGame(client)) {
+		return;
+	}
+
+	if (result == ConVarQuery_Okay && StringToInt(cvarValue) != 0) {
+		PrintToChat(client, "[MGE] Last log: %s", g_sLastLogUrl[client]);
+		return;
+	}
+
+	KeyValues kv = new KeyValues("data");
+	char typeStr[4];
+	IntToString(MOTDPANEL_TYPE_URL, typeStr, sizeof(typeStr));
+	kv.SetString("title", "MGE Logs");
+	kv.SetString("type", typeStr);
+	kv.SetString("msg", g_sLastLogUrl[client]);
+	kv.SetNum("customsvr", 1);
+	ShowVGUIPanel(client, "info", kv);
+	delete kv;
 }
