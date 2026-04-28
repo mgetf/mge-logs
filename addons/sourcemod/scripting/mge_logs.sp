@@ -6,7 +6,7 @@
 #include <mge>
 #include <ripext>
 
-#define PLUGIN_VERSION "0.1.0"
+#define PLUGIN_VERSION "0.1"
 
 #define MAX_ARENAS 64
 #define MAX_SESSION_PLAYERS 4
