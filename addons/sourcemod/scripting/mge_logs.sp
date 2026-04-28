@@ -214,23 +214,30 @@ public void Frame_FlushPendingSessions(int arena_index)
 	if (g_bSessionActive[arena_index]) {
 		if (g_bSession2v2[arena_index]) {
 			char winTeam[8];
-			strcopy(winTeam, sizeof(winTeam),
-				g_iSession2v2WinningTeam[arena_index] == 2 ? "Red" : "Blue");
+			bool team1Won = g_iSession2v2WinningTeam[arena_index] == 2;
+			strcopy(winTeam, sizeof(winTeam), team1Won ? "Red" : "Blue");
+
+			// team1 = players[0..1] (Red), team2 = players[2..3] (Blue)
+			int w1 = team1Won ? 0 : 2;
+			int w2 = team1Won ? 1 : 3;
+			int l1 = team1Won ? 2 : 0;
+			int l2 = team1Won ? 3 : 1;
 
 			AppendMetaLine(arena_index,
-				"World triggered \"mge_match_end\" (winning_team \"%s\") (winning_score \"%d\") (losing_score \"%d\") (t1p1 \"%s\") (t1p2 \"%s\") (t2p1 \"%s\") (t2p2 \"%s\")",
+				"World triggered \"mge_match_end\" (winning_team \"%s\") (winning_score \"%d\") (losing_score \"%d\") (winner_p1 \"%s\") (winner_p2 \"%s\") (loser_p1 \"%s\") (loser_p2 \"%s\")",
 				winTeam,
 				g_iSessionWinnerScore[arena_index],
 				g_iSessionLoserScore[arena_index],
-				g_sSessionPlayers[arena_index][0],
-				g_sSessionPlayers[arena_index][1],
-				g_sSessionPlayers[arena_index][2],
-				g_sSessionPlayers[arena_index][3]);
+				g_sSessionPlayers[arena_index][w1],
+				g_sSessionPlayers[arena_index][w2],
+				g_sSessionPlayers[arena_index][l1],
+				g_sSessionPlayers[arena_index][l2]);
 		}
 		else {
 			AppendMetaLine(arena_index,
-				"World triggered \"mge_match_end\" (winner \"%s\") (winner_score \"%d\") (loser_score \"%d\")",
+				"World triggered \"mge_match_end\" (winner \"%s\") (loser \"%s\") (winner_score \"%d\") (loser_score \"%d\")",
 				g_sSessionWinnerSteamId[arena_index],
+				g_sSessionLoserSteamId[arena_index],
 				g_iSessionWinnerScore[arena_index],
 				g_iSessionLoserScore[arena_index]);
 		}
