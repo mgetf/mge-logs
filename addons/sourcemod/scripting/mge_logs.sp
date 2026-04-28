@@ -15,6 +15,8 @@
 #define MATCH_ID_LEN 17
 #define MAX_UPLOAD_LOG_SIZE (512 * 1024)
 #define MAX_LAST_LOG_URL_LEN 256
+#define MAX_HOSTNAME_LEN 128
+#define MAX_AUTH_HEADER_LEN 160
 
 static const char g_sClassNames[10][] = {
 	"", "scout", "sniper", "soldier", "demoman",
@@ -34,6 +36,7 @@ ConVar g_cvMaxFiles;
 ConVar g_cvUpload;
 ConVar g_cvApiKey;
 ConVar g_cvUploadUrl;
+ConVar g_cvHostname;
 
 bool g_bGameLogHooked;
 bool g_bMGEAvailable;
@@ -66,6 +69,8 @@ public void OnPluginStart()
 	g_cvUpload    = CreateConVar("mge_logs_upload",     "0",  "Upload completed logs to the mge.tf backend.", _, true, 0.0, true, 1.0);
 	g_cvApiKey    = CreateConVar("mge_logs_apikey",     "",   "API key for log upload.", FCVAR_PROTECTED);
 	g_cvUploadUrl = CreateConVar("mge_logs_upload_url", "",   "Full endpoint URL for log upload (e.g. https://mge.tf/api/logs/upload).");
+
+	g_cvHostname = FindConVar("hostname");
 
 	RegConsoleCmd("sm_lastlog", Cmd_LastLog);
 	AddCommandListener(Listener_Say, "say");
@@ -182,7 +187,24 @@ public void MGE_OnPlayerArenaRemoved(int client, int arena_index)
 		return;
 	}
 
-	if (g_bSessionActive[arena_index] && !g_bSessionPendingFlush[arena_index]) {
+	if (!g_bSessionActive[arena_index] || g_bSessionPendingFlush[arena_index]) {
+		return;
+	}
+
+	char steamId[MAX_STEAMID_LEN];
+	if (!GetClientAuthId(client, AuthId_Steam3, steamId, sizeof(steamId))) {
+		return;
+	}
+
+	bool isInSession = false;
+	for (int i = 0; i < g_iSessionPlayerCount[arena_index]; i++) {
+		if (StrEqual(steamId, g_sSessionPlayers[arena_index][i])) {
+			isInSession = true;
+			break;
+		}
+	}
+
+	if (isInSession) {
 		AbortSession(arena_index, "player_disconnect");
 	}
 }
@@ -648,6 +670,28 @@ bool ReadLogFile(const char[] path, char[] buffer, int maxlen)
 	return true;
 }
 
+void NotifyArenaPlayers(int arena, const char[] message)
+{
+	for (int i = 0; i < g_iSessionPlayerCount[arena]; i++) {
+		if (g_sSessionPlayers[arena][i][0] == '\0') {
+			continue;
+		}
+
+		for (int client = 1; client <= MaxClients; client++) {
+			if (!IsClientInGame(client)) {
+				continue;
+			}
+
+			char clientSteamId[MAX_STEAMID_LEN];
+			if (GetClientAuthId(client, AuthId_Steam3, clientSteamId, sizeof(clientSteamId))
+				&& StrEqual(clientSteamId, g_sSessionPlayers[arena][i]))
+			{
+				PrintToChat(client, "%s", message);
+			}
+		}
+	}
+}
+
 void UploadSession(int arena, const char[] filePath)
 {
 	if (!g_cvUpload.BoolValue || !LibraryExists("ripext")) {
@@ -666,22 +710,36 @@ void UploadSession(int arena, const char[] filePath)
 		return;
 	}
 
+	NotifyArenaPlayers(arena, "[MGE] Uploading match log...");
+
+	char hostname[MAX_HOSTNAME_LEN];
+	if (g_cvHostname != null) {
+		g_cvHostname.GetString(hostname, sizeof(hostname));
+	}
+
 	DataPack pack = new DataPack();
 	pack.WriteString(filePath);
 	pack.WriteString(apiKey);
 	pack.WriteString(url);
 	pack.WriteString(g_sSessionMatchId[arena]);
+	pack.WriteString(hostname);
 	pack.WriteCell(g_iSessionPlayerCount[arena]);
 	for (int i = 0; i < g_iSessionPlayerCount[arena]; i++) {
 		pack.WriteString(g_sSessionPlayers[arena][i]);
 	}
 
+	char authHeader[MAX_AUTH_HEADER_LEN];
+	FormatEx(authHeader, sizeof(authHeader), "Bearer %s", apiKey);
+
 	JSONObject payload = new JSONObject();
-	payload.SetString("key", apiKey);
 	payload.SetString("matchid", g_sSessionMatchId[arena]);
 	payload.SetString("log", s_UploadLogBuf);
+	if (hostname[0] != '\0') {
+		payload.SetString("hostname", hostname);
+	}
 
 	HTTPRequest request = new HTTPRequest(url);
+	request.SetHeader("Authorization", authHeader);
 	request.Post(payload, Upload_Complete, pack);
 	delete payload;
 }
@@ -706,24 +764,89 @@ void DoStoreUrlFromPack(DataPack pack, const char[] logUrl)
 {
 	char skipBuf[PLATFORM_MAX_PATH];
 	char skipSmall[MATCH_ID_LEN];
+	char skipHostname[MAX_HOSTNAME_LEN];
 	pack.Reset();
-	pack.ReadString(skipBuf, sizeof(skipBuf));    // filePath
-	pack.ReadString(skipBuf, sizeof(skipBuf));    // apiKey
-	pack.ReadString(skipBuf, sizeof(skipBuf));    // uploadUrl
-	pack.ReadString(skipSmall, sizeof(skipSmall)); // matchId
+	pack.ReadString(skipBuf, sizeof(skipBuf));         // filePath
+	pack.ReadString(skipBuf, sizeof(skipBuf));         // apiKey
+	pack.ReadString(skipBuf, sizeof(skipBuf));         // uploadUrl
+	pack.ReadString(skipSmall, sizeof(skipSmall));     // matchId
+	pack.ReadString(skipHostname, sizeof(skipHostname)); // hostname
 
 	int count = pack.ReadCell();
 	for (int i = 0; i < count; i++) {
 		char steamId[MAX_STEAMID_LEN];
 		pack.ReadString(steamId, sizeof(steamId));
 		StoreUrlForSteamId(steamId, logUrl);
+
+		for (int client = 1; client <= MaxClients; client++) {
+			if (!IsClientInGame(client)) {
+				continue;
+			}
+
+			char clientSteamId[MAX_STEAMID_LEN];
+			if (GetClientAuthId(client, AuthId_Steam3, clientSteamId, sizeof(clientSteamId))
+				&& StrEqual(clientSteamId, steamId))
+			{
+				PrintToChat(client, "[MGE] Log uploaded! %s", logUrl);
+			}
+		}
+	}
+}
+
+void NotifyPlayersOfError(DataPack pack, const char[] errorMsg)
+{
+	char skipBuf[PLATFORM_MAX_PATH];
+	char skipSmall[MATCH_ID_LEN];
+	char skipHostname[MAX_HOSTNAME_LEN];
+	pack.Reset();
+	pack.ReadString(skipBuf, sizeof(skipBuf));         // filePath
+	pack.ReadString(skipBuf, sizeof(skipBuf));         // apiKey
+	pack.ReadString(skipBuf, sizeof(skipBuf));         // uploadUrl
+	pack.ReadString(skipSmall, sizeof(skipSmall));     // matchId
+	pack.ReadString(skipHostname, sizeof(skipHostname)); // hostname
+
+	int count = pack.ReadCell();
+	for (int i = 0; i < count; i++) {
+		char steamId[MAX_STEAMID_LEN];
+		pack.ReadString(steamId, sizeof(steamId));
+
+		for (int client = 1; client <= MaxClients; client++) {
+			if (!IsClientInGame(client)) {
+				continue;
+			}
+
+			char clientSteamId[MAX_STEAMID_LEN];
+			if (GetClientAuthId(client, AuthId_Steam3, clientSteamId, sizeof(clientSteamId))
+				&& StrEqual(clientSteamId, steamId))
+			{
+				PrintToChat(client, "[MGE] Log upload failed: %s", errorMsg);
+			}
+		}
 	}
 }
 
 public void Upload_Complete(HTTPResponse response, DataPack pack, const char[] error)
 {
 	if (response.Status != HTTPStatus_OK) {
-		LogError("[mge_logs] Upload failed (HTTP %d): %s", response.Status, error);
+		int statusCode = view_as<int>(response.Status);
+
+		if (statusCode >= 400 && statusCode < 500) {
+			char errorMsg[256];
+			errorMsg = "parse error";
+
+			JSONObject errJson = view_as<JSONObject>(response.Data);
+			if (errJson != null) {
+				errJson.GetString("error", errorMsg, sizeof(errorMsg));
+			}
+
+			LogError("[mge_logs] Upload rejected (HTTP %d): %s", statusCode, errorMsg);
+			NotifyPlayersOfError(pack, errorMsg);
+			delete pack;
+			return;
+		}
+
+		LogError("[mge_logs] Upload failed (HTTP %d): %s", statusCode, error);
+		NotifyPlayersOfError(pack, "server error, retrying in 5s...");
 		CreateTimer(5.0, Timer_RetryUpload, pack);
 		return;
 	}
@@ -745,10 +868,12 @@ public Action Timer_RetryUpload(Handle timer, DataPack pack)
 {
 	pack.Reset();
 	char filePath[PLATFORM_MAX_PATH], apiKey[128], url[256], matchId[MATCH_ID_LEN];
+	char hostname[MAX_HOSTNAME_LEN];
 	pack.ReadString(filePath, sizeof(filePath));
 	pack.ReadString(apiKey, sizeof(apiKey));
 	pack.ReadString(url, sizeof(url));
 	pack.ReadString(matchId, sizeof(matchId));
+	pack.ReadString(hostname, sizeof(hostname));
 
 	if (!ReadLogFile(filePath, s_UploadLogBuf, sizeof(s_UploadLogBuf))) {
 		LogError("[mge_logs] Retry upload: could not re-read log file %s", filePath);
@@ -756,12 +881,18 @@ public Action Timer_RetryUpload(Handle timer, DataPack pack)
 		return Plugin_Stop;
 	}
 
+	char authHeader[MAX_AUTH_HEADER_LEN];
+	FormatEx(authHeader, sizeof(authHeader), "Bearer %s", apiKey);
+
 	JSONObject payload = new JSONObject();
-	payload.SetString("key", apiKey);
 	payload.SetString("matchid", matchId);
 	payload.SetString("log", s_UploadLogBuf);
+	if (hostname[0] != '\0') {
+		payload.SetString("hostname", hostname);
+	}
 
 	HTTPRequest request = new HTTPRequest(url);
+	request.SetHeader("Authorization", authHeader);
 	request.Post(payload, Upload_RetryComplete, pack);
 	delete payload;
 
@@ -771,7 +902,23 @@ public Action Timer_RetryUpload(Handle timer, DataPack pack)
 public void Upload_RetryComplete(HTTPResponse response, DataPack pack, const char[] error)
 {
 	if (response.Status != HTTPStatus_OK) {
-		LogError("[mge_logs] Upload retry failed (HTTP %d): %s", response.Status, error);
+		int statusCode = view_as<int>(response.Status);
+
+		if (statusCode >= 400 && statusCode < 500) {
+			char errorMsg[256];
+			errorMsg = "parse error";
+
+			JSONObject errJson = view_as<JSONObject>(response.Data);
+			if (errJson != null) {
+				errJson.GetString("error", errorMsg, sizeof(errorMsg));
+			}
+
+			LogError("[mge_logs] Upload retry rejected (HTTP %d): %s", statusCode, errorMsg);
+			NotifyPlayersOfError(pack, errorMsg);
+		} else {
+			LogError("[mge_logs] Upload retry failed (HTTP %d): %s", statusCode, error);
+		}
+
 		delete pack;
 		return;
 	}

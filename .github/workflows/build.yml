@@ -1,0 +1,40 @@
+name: Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Compile and release
+    runs-on: ubuntu-latest
+
+    if: "!contains(github.event.head_commit.message, '[ci skip]')"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup SourcePawn Compiler
+        uses: rumblefrog/setup-sp@master
+        with:
+          version: "1.12.x"
+
+      - name: Compile
+        run: |
+          spcomp \
+            -i"./addons/sourcemod/scripting/include/" \
+            addons/sourcemod/scripting/mge_logs.sp \
+            -o addons/sourcemod/plugins/mge_logs.smx
+
+      - name: Package
+        run: |
+          mkdir build
+          7za a -r build/mge_logs.zip addons/
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: build/mge_logs.zip
+          fail_on_unmatched_files: true
+          generate_release_notes: true
