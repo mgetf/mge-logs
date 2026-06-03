@@ -6,7 +6,7 @@
 #include <mge>
 #include <ripext>
 
-#define PLUGIN_VERSION "0.1.1"
+#define PLUGIN_VERSION "0.2"
 
 #define MAX_ARENAS 64
 #define MAX_SESSION_PLAYERS 4
@@ -37,6 +37,10 @@ ConVar g_cvUpload;
 ConVar g_cvApiKey;
 ConVar g_cvUploadUrl;
 ConVar g_cvHostname;
+
+char g_sApiKey[128];
+char g_sUploadUrl[256];
+char g_sHostname[MAX_HOSTNAME_LEN];
 
 bool g_bGameLogHooked;
 bool g_bMGEAvailable;
@@ -71,6 +75,16 @@ public void OnPluginStart()
 	g_cvUploadUrl = CreateConVar("mge_logs_upload_url", "",   "Full endpoint URL for log upload (e.g. https://mge.tf/api/logs/upload).");
 
 	g_cvHostname = FindConVar("hostname");
+
+	g_cvApiKey.GetString(g_sApiKey, sizeof(g_sApiKey));
+	g_cvUploadUrl.GetString(g_sUploadUrl, sizeof(g_sUploadUrl));
+	if (g_cvHostname != null)
+		g_cvHostname.GetString(g_sHostname, sizeof(g_sHostname));
+
+	g_cvApiKey.AddChangeHook(OnUploadConVarChanged);
+	g_cvUploadUrl.AddChangeHook(OnUploadConVarChanged);
+	if (g_cvHostname != null)
+		g_cvHostname.AddChangeHook(OnUploadConVarChanged);
 
 	RegConsoleCmd("sm_lastlog", Cmd_LastLog);
 	AddCommandListener(Listener_Say, "say");
@@ -122,6 +136,16 @@ public void OnLibraryRemoved(const char[] name)
 public void OnClientDisconnected(int client)
 {
 	g_sLastLogUrl[client][0] = '\0';
+}
+
+public void OnUploadConVarChanged(ConVar convar, const char[] oldValue, const char[] newValue)
+{
+	if (convar == g_cvApiKey)
+		strcopy(g_sApiKey, sizeof(g_sApiKey), newValue);
+	else if (convar == g_cvUploadUrl)
+		strcopy(g_sUploadUrl, sizeof(g_sUploadUrl), newValue);
+	else if (convar == g_cvHostname)
+		strcopy(g_sHostname, sizeof(g_sHostname), newValue);
 }
 
 public void MGE_On1v1MatchStart(int arena_index, int player1, int player2)
@@ -416,7 +440,13 @@ void AbortSession(int arena, const char[] reason)
 	AppendMetaLine(arena,
 		"World triggered \"mge_match_aborted\" (reason \"%s\")", reason);
 
-	FlushSession(arena, "_incomplete");
+	char filePath[PLATFORM_MAX_PATH];
+	BuildPath(Path_SM, filePath, sizeof(filePath),
+		"logs/mge/mge_%s_incomplete.log", g_sSessionMatchId[arena]);
+
+	if (FlushSession(arena, "_incomplete")) {
+		UploadSession(arena, filePath);
+	}
 	DestroySession(arena);
 }
 
@@ -698,11 +728,7 @@ void UploadSession(int arena, const char[] filePath)
 		return;
 	}
 
-	char apiKey[128], url[256];
-	g_cvApiKey.GetString(apiKey, sizeof(apiKey));
-	g_cvUploadUrl.GetString(url, sizeof(url));
-
-	if (apiKey[0] == '\0' || url[0] == '\0') {
+	if (g_sApiKey[0] == '\0' || g_sUploadUrl[0] == '\0') {
 		return;
 	}
 
@@ -712,33 +738,28 @@ void UploadSession(int arena, const char[] filePath)
 
 	NotifyArenaPlayers(arena, "[MGE] Uploading match log...");
 
-	char hostname[MAX_HOSTNAME_LEN];
-	if (g_cvHostname != null) {
-		g_cvHostname.GetString(hostname, sizeof(hostname));
-	}
-
 	DataPack pack = new DataPack();
 	pack.WriteString(filePath);
-	pack.WriteString(apiKey);
-	pack.WriteString(url);
+	pack.WriteString(g_sApiKey);
+	pack.WriteString(g_sUploadUrl);
 	pack.WriteString(g_sSessionMatchId[arena]);
-	pack.WriteString(hostname);
+	pack.WriteString(g_sHostname);
 	pack.WriteCell(g_iSessionPlayerCount[arena]);
 	for (int i = 0; i < g_iSessionPlayerCount[arena]; i++) {
 		pack.WriteString(g_sSessionPlayers[arena][i]);
 	}
 
 	char authHeader[MAX_AUTH_HEADER_LEN];
-	FormatEx(authHeader, sizeof(authHeader), "Bearer %s", apiKey);
+	FormatEx(authHeader, sizeof(authHeader), "Bearer %s", g_sApiKey);
 
 	JSONObject payload = new JSONObject();
 	payload.SetString("matchid", g_sSessionMatchId[arena]);
 	payload.SetString("log", s_UploadLogBuf);
-	if (hostname[0] != '\0') {
-		payload.SetString("hostname", hostname);
+	if (g_sHostname[0] != '\0') {
+		payload.SetString("hostname", g_sHostname);
 	}
 
-	HTTPRequest request = new HTTPRequest(url);
+	HTTPRequest request = new HTTPRequest(g_sUploadUrl);
 	request.SetHeader("Authorization", authHeader);
 	request.Post(payload, Upload_Complete, pack);
 	delete payload;
