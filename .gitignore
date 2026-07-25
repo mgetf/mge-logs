@@ -1,0 +1,10 @@
+# SourceMod build artifacts (compiled locally, not the tracked release binary)
+*.smx.bak
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+
+# Local runtime output — this plugin writes per-match logs here on a live server
+logs/mge/
