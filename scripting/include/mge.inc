@@ -29,12 +29,28 @@
 // Player Statistics Structure
 enum struct MGEPlayerStats
 {
-    int elo;            // Current ELO rating
+    int elo;            // Stored rating from the currently active rating engine (mgemod_rating_engine).
+                         // Same number the HUD, !rank, and chat use (raw rating, not rating-2*RD).
     int kills;          // Total kills
     int deaths;         // Total deaths  
     int wins;           // Total wins
     int losses;         // Total losses
     float rating;       // Win/Loss ratio
+}
+
+// HUD Score Line Context
+// Append-only: new fields must be added at the end so existing compiled
+// consumers keep reading correct offsets for the fields they know about.
+enum struct MGEHudLineInfo
+{
+    int viewer;          // Client who will see this HUD line
+    int player;          // Player whose score/rating this line represents
+    int arena_index;     // Arena this line belongs to
+    int slot;            // SLOT_ONE..SLOT_FOUR team/player slot for this line
+    int score;           // Current score being shown on this line
+    int elo;             // Player's current global ELO rating (read-only reference)
+    bool isSpectator;    // True if the viewer is spectating/queued rather than actively fighting
+    char extraDisplay[32]; // Mutable text placed inside the "(...)" on the HUD line; defaults to the ELO digits, but any plugin (ELO, ranks, streaks, etc.) may rewrite it
 }
 
 // Arena Information Structure
@@ -58,6 +74,16 @@ enum
     AS_AFTERFIGHT,
     AS_REPORTED,
     AS_WAITING_READY
+};
+
+enum MGEPlayerStatsLoadState
+{
+    MGE_STATS_NONE = 0,
+    MGE_STATS_LOADING,
+    MGE_STATS_LOADED,
+    MGE_STATS_AUTH_FAILED,
+    MGE_STATS_DB_FAILED,
+    MGE_STATS_DISABLED
 };
 
 /**
@@ -151,14 +177,41 @@ forward void MGE_On2v2MatchEnd(int arena_index, int winning_team, int winning_sc
 forward void MGE_OnArenaPlayerDeath(int victim, int attacker, int arena_index);
 
 /**
- * Called when a player's ELO changes
+ * Called when a player's rating changes, regardless of active rating engine.
+ * Fires for the winner before the loser - external plugins that pair calls by call
+ * order (e.g. per-class ELO trackers) rely on this and it is preserved across engines.
  *
  * @param client         Client index
- * @param old_elo        Previous ELO rating
- * @param new_elo        New ELO rating
+ * @param old_elo        Previous rating
+ * @param new_elo        New rating
  * @param arena_index    Arena where change occurred
  */
 forward void MGE_OnPlayerELOChange(int client, int old_elo, int new_elo, int arena_index);
+
+/**
+ * Called when a player's rating changes under the Glicko-2 rating engine, carrying the
+ * rating deviation (RD) alongside the rating itself. Only fires when mgemod_rating_engine
+ * is "glicko2" - MGE_OnPlayerELOChange still fires alongside it for every engine, including
+ * this one, for consumers that only care about the plain rating number.
+ * Fires for the winner before the loser, same ordering guarantee as MGE_OnPlayerELOChange.
+ *
+ * @param client         Client index
+ * @param old_rating     Previous rating
+ * @param new_rating     New rating
+ * @param old_rd         Previous rating deviation
+ * @param new_rd         New rating deviation
+ * @param arena_index    Arena where change occurred
+ */
+forward void MGE_OnPlayerRatingChange(int client, int old_rating, int new_rating, float old_rd, float new_rd, int arena_index);
+
+/**
+ * Called when a player's statistics loading state changes
+ *
+ * @param client         Client index
+ * @param old_state      Previous MGEPlayerStatsLoadState value
+ * @param new_state      New MGEPlayerStatsLoadState value
+ */
+forward void MGE_OnPlayerStatsLoadStateChanged(int client, MGEPlayerStatsLoadState old_state, MGEPlayerStatsLoadState new_state);
 
 /**
  * Called when 2v2 ready system starts
@@ -177,6 +230,48 @@ forward void MGE_On2v2ReadyStart(int arena_index);
 forward void MGE_On2v2PlayerReady(int client, int arena_index, bool ready_status);
 
 /**
+ * Called when arena team scores change or are reset
+ *
+ * @param arena_index    Arena index
+ * @param red_score      Red team score (SLOT_ONE)
+ * @param blu_score      Blue team score (SLOT_TWO)
+ */
+forward void MGE_OnArenaScoreChange(int arena_index, int red_score, int blu_score);
+
+/**
+ * Called whenever an arena's status changes, regardless of cause (countdown, fight start/end,
+ * a player leaving mid-match, timeout, etc.)
+ *
+ * @param arena_index    Arena index
+ * @param old_status     Previous status (AS_* constant)
+ * @param new_status     New status (AS_* constant)
+ */
+forward void MGE_OnArenaStatusChange(int arena_index, int old_status, int new_status);
+
+/**
+ * Called once per HUD score report, after both score lines' context has been
+ * built and before their text is rendered. lines[0] is the red/SLOT_ONE line,
+ * lines[1] is the blu/SLOT_TWO line (2v2 team lines still carry only one
+ * representative player, same as what's shown in the parentheses today).
+ * External plugins may rewrite lines[i].extraDisplay in place (e.g.
+ * "1500/1610", or any other per-line text: ranks, streaks, badges, etc.)
+ * without needing to parse HUD text. Multiple plugins can chain off this
+ * same forward - each one should read the current extraDisplay and
+ * append/rewrite it, rather than assuming it starts empty. extraDisplay
+ * text only ends up on screen for a given line if that line would
+ * otherwise show an ELO value (stats loaded, not a bot, ELO display
+ * enabled) - the forward still fires every time so plugins always see
+ * the full report context.
+ *
+ * @param arena_index    Arena whose score report is being shown
+ * @param client         Client who will receive the HUD text
+ * @param is_spectator   True if the client is spectating (or queued), false if actively fighting
+ * @param redLine        Mutable HUD line context for the red/SLOT_ONE line
+ * @param bluLine        Mutable HUD line context for the blu/SLOT_TWO line
+ */
+forward void MGE_OnFormatHudLines(int arena_index, int client, bool is_spectator, MGEHudLineInfo redLine, MGEHudLineInfo bluLine);
+
+/**
  * Called when a map config file is missing
  * Return Plugin_Handled to suppress SetFailState (e.g. to download the config asynchronously)
  * Return Plugin_Continue to allow normal SetFailState behavior
@@ -186,6 +281,18 @@ forward void MGE_On2v2PlayerReady(int client, int arena_index, bool ready_status
  * @return               Plugin_Handled to suppress SetFailState, Plugin_Continue otherwise
  */
 forward Action MGE_OnMapConfigMissing(const char[] mapName, const char[] configPath);
+
+/**
+ * Called when a map config file exists but fails to parse or contains no valid arenas.
+ * Return Plugin_Handled to suppress SetFailState and take over recovery (e.g. delete and redownload).
+ * Return Plugin_Continue to allow normal SetFailState behavior.
+ * Only fired when a config file is present but unparseable — missing files use MGE_OnMapConfigMissing.
+ *
+ * @param mapName        Current map name (workshop-normalized)
+ * @param configPath     Full absolute path to the invalid config file
+ * @return               Plugin_Handled to suppress SetFailState, Plugin_Continue otherwise
+ */
+forward Action MGE_OnMapConfigInvalid(const char[] mapName, const char[] configPath);
 
 /**
  * Reports that a previously deferred config download has failed and no config is available.
@@ -213,6 +320,14 @@ native int MGE_GetPlayerArena(int client);
 native bool MGE_GetPlayerStats(int client, any[] stats);
 
 /**
+ * Gets a player's statistics loading state
+ *
+ * @param client         Client index
+ * @return               Current MGEPlayerStatsLoadState value
+ */
+native MGEPlayerStatsLoadState MGE_GetPlayerStatsLoadState(int client);
+
+/**
  * Gets complete arena information
  *
  * @param arena_index    Arena index
@@ -222,10 +337,13 @@ native bool MGE_GetPlayerStats(int client, any[] stats);
 native bool MGE_GetArenaInfo(int arena_index, any[] info);
 
 /**
- * Checks if a player is currently in an MGE arena
+ * Checks if a player currently occupies an active arena slot - either
+ * waiting to play (e.g. alone in the arena, or during countdown) or
+ * actively playing. Players queued behind the active slots (spectating
+ * while waiting for their turn) are NOT considered to be "in arena".
  *
  * @param client         Client index
- * @return               True if in arena, false otherwise
+ * @return               True if occupying an active slot, false otherwise
  */
 native bool MGE_IsPlayerInArena(int client);
 
@@ -317,6 +435,15 @@ native bool MGE_ArenaHasGameMode(int arena_index, int game_mode);
  */
 native bool MGE_IsValidSlotForArena(int arena_index, int slot);
 
+/**
+ * Gets the current score for an arena team
+ *
+ * @param arena_index    Arena index
+ * @param team_slot      Team slot (SLOT_ONE = red, SLOT_TWO = blue)
+ * @return               Team score, or 0 if arena or slot is invalid
+ */
+native int MGE_GetArenaScore(int arena_index, int team_slot);
+
 
 public SharedPlugin __pl_mge = 
 {
@@ -334,6 +461,7 @@ public void __pl_mge_SetNTVOptional()
 {
     MarkNativeAsOptional("MGE_GetPlayerArena");
     MarkNativeAsOptional("MGE_GetPlayerStats");
+    MarkNativeAsOptional("MGE_GetPlayerStatsLoadState");
     MarkNativeAsOptional("MGE_GetArenaInfo");
     MarkNativeAsOptional("MGE_IsPlayerInArena");
     MarkNativeAsOptional("MGE_GetArenaCount");
@@ -346,6 +474,6 @@ public void __pl_mge_SetNTVOptional()
     MarkNativeAsOptional("MGE_GetPlayerTeammate");
     MarkNativeAsOptional("MGE_ArenaHasGameMode");
     MarkNativeAsOptional("MGE_IsValidSlotForArena");
-    MarkNativeAsOptional("MGE_ReportConfigUnavailable");
+    MarkNativeAsOptional("MGE_GetArenaScore");
 }
 #endif
