@@ -1,0 +1,60 @@
+"Phrases"
+{
+	"LogUploading"
+	{
+		"en"			"{green}[MGE]{default} Uploading match log..."
+		"chi"			"{green}[MGE]{default} 正在上传对局日志……"
+		"de"			"{green}[MGE]{default} Match-Log wird hochgeladen..."
+		"ru"			"{green}[MGE]{default} Загрузка лога матча..."
+		"es"			"{green}[MGE]{default} Subiendo el log de la partida..."
+		"pt"			"{green}[MGE]{default} Enviando o log da partida..."
+	}
+	"LogUploaded"
+	{
+		"#format"		"{1:s}"
+		"en"			"{green}[MGE]{default} Log uploaded! {green}{1}"
+		"chi"			"{green}[MGE]{default} 日志已上传！{green}{1}"
+		"de"			"{green}[MGE]{default} Log hochgeladen! {green}{1}"
+		"ru"			"{green}[MGE]{default} Лог загружен! {green}{1}"
+		"es"			"{green}[MGE]{default} ¡Log subido! {green}{1}"
+		"pt"			"{green}[MGE]{default} Log enviado! {green}{1}"
+	}
+	"LogUploadFailed"
+	{
+		"#format"		"{1:s}"
+		"en"			"{green}[MGE]{default} Log upload failed: {1}"
+		"chi"			"{green}[MGE]{default} 日志上传失败：{1}"
+		"de"			"{green}[MGE]{default} Log-Upload fehlgeschlagen: {1}"
+		"ru"			"{green}[MGE]{default} Не удалось загрузить лог: {1}"
+		"es"			"{green}[MGE]{default} Falló la subida del log: {1}"
+		"pt"			"{green}[MGE]{default} Falha ao enviar o log: {1}"
+	}
+	"NoMatchesPlayed"
+	{
+		"en"			"{green}[MGE]{default} You haven't played any matches yet."
+		"chi"			"{green}[MGE]{default} 您还没有打过任何对局。"
+		"de"			"{green}[MGE]{default} Du hast noch keine Matches gespielt."
+		"ru"			"{green}[MGE]{default} Вы ещё не сыграли ни одного матча."
+		"es"			"{green}[MGE]{default} No jugaste ninguno todavía."
+		"pt"			"{green}[MGE]{default} Você ainda não jogou nenhuma partida."
+	}
+	"LogUrl"
+	{
+		"#format"		"{1:s}"
+		"en"			"{green}[MGE]{default} Log: {green}{1}"
+		"chi"			"{green}[MGE]{default} 日志：{green}{1}"
+		"de"			"{green}[MGE]{default} Log: {green}{1}"
+		"ru"			"{green}[MGE]{default} Лог: {green}{1}"
+		"es"			"{green}[MGE]{default} Log: {green}{1}"
+		"pt"			"{green}[MGE]{default} Log: {green}{1}"
+	}
+	"EnableHtmlMotd"
+	{
+		"en"			"{green}[MGE]{default} Set {green}cl_disablehtmlmotd 0{default} in console to open logs in-game."
+		"chi"			"{green}[MGE]{default} 请在控制台输入 {green}cl_disablehtmlmotd 0{default} 以在游戏内打开日志。"
+		"de"			"{green}[MGE]{default} Setze {green}cl_disablehtmlmotd 0{default} in der Konsole, um Logs im Spiel zu öffnen."
+		"ru"			"{green}[MGE]{default} Введи в консоли {green}cl_disablehtmlmotd 0{default}, чтобы открывать логи в игре."
+		"es"			"{green}[MGE]{default} Poné {green}cl_disablehtmlmotd 0{default} en consola para abrir los logs in-game."
+		"pt"			"{green}[MGE]{default} Defina {green}cl_disablehtmlmotd 0{default} no console para abrir os logs no jogo."
+	}
+}

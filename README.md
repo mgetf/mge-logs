@@ -8,10 +8,10 @@ See [`docs/rfc-001-mge-match-logging.md`](docs/rfc-001-mge-match-logging.md) for
 
 ## How it works
 
-- **Lifecycle** — Hooks MGEMod's public forwards (`MGE_On1v1MatchStart`, `MGE_On2v2MatchStart`, `MGE_On1v1MatchEnd`, `MGE_On2v2MatchEnd`, `MGE_OnPlayerELOChange`, `MGE_OnPlayerArenaRemoved`) via [`mge.inc`](addons/sourcemod/scripting/include/mge.inc) to know when a match starts, ends, or is aborted, and for which players.
+- **Lifecycle** — Hooks MGEMod's public forwards (`MGE_On1v1MatchStart`, `MGE_On2v2MatchStart`, `MGE_On1v1MatchEnd`, `MGE_On2v2MatchEnd`, `MGE_OnPlayerELOChange`, `MGE_OnPlayerArenaRemoved`) via [`mge.inc`](scripting/include/mge.inc) to know when a match starts, ends, or is aborted, and for which players.
 - **Enrichment** — Relies on existing community plugins (`supstats2`, `medicstats`) that already emit rich per-event log lines (damage, accuracy, airshots, uber tracking) unconditionally via `AddGameLogHook()`. `mge_logs` does not duplicate this logic — it only captures and routes the lines.
 - **Collection** — Buffers lines per active arena session and writes one `.log` file per match to `logs/mge/mge_<matchid>.log` (or `..._incomplete.log` if the match was aborted by disconnect, map change, or plugin unload).
-- **Upload (optional)** — If `mge_logs_upload` is enabled and an API key/URL are configured, the completed log is POSTed to the mge.tf backend via [sm-ripext](https://github.com/ErasedDeath/sm-ripext), and the returned URL is available in-game via `!lastlog`.
+- **Upload (optional)** — If `mge_logs_upload` is enabled and an API key/URL are configured, the completed log is POSTed to the mge.tf backend via [sm-ripext](https://github.com/ErasedDeath/sm-ripext), and the returned URL is available in-game via `!log`.
 
 ## Dependencies
 
@@ -21,10 +21,11 @@ See [`docs/rfc-001-mge-match-logging.md`](docs/rfc-001-mge-match-logging.md) for
 
 ## Installation
 
-1. Copy `addons/sourcemod/plugins/mge_logs.smx` to your server's `addons/sourcemod/plugins/` directory.
-2. Ensure MGEMod is installed and loaded.
-3. (Optional) Install `sm-ripext` if you want log upload enabled.
-4. Configure ConVars (see below) in your server config or `sourcemod/configs/`.
+1. Copy `plugins/mge_logs.smx` to your server's `addons/sourcemod/plugins/` directory.
+2. Copy `translations/mge_logs.phrases.txt` to your server's `addons/sourcemod/translations/` directory.
+3. Ensure MGEMod is installed and loaded.
+4. (Optional) Install `sm-ripext` if you want log upload enabled.
+5. Configure ConVars (see below) in your server config or `sourcemod/configs/`.
 
 ## ConVars
 
@@ -38,7 +39,7 @@ See [`docs/rfc-001-mge-match-logging.md`](docs/rfc-001-mge-match-logging.md) for
 
 ## In-game commands
 
-- `!lastlog` / `.lastlog` — Shows the player's most recent uploaded match log URL (via MOTD panel, falls back to chat if HTML MOTD is disabled).
+- `!log` / `.log` — Opens the last match log uploaded this session (since the player connected) in a MOTD browser. Falls back to the URL in chat if HTML MOTD is disabled. If they have not finished a match this session, tells them they have not played any yet.
 
 ## Log format
 
@@ -46,16 +47,16 @@ Each match produces a standard TF2-style log file with MGE-specific extensions (
 
 ## Building
 
-Requires the [SourcePawn compiler](https://github.com/alliedmodders/sourcemod) (`spcomp`) and the includes vendored in `addons/sourcemod/scripting/include/`:
+Requires the [SourcePawn compiler](https://github.com/alliedmodders/sourcemod) (`spcomp`) and the includes vendored in `scripting/include/`:
 
 ```bash
 spcomp \
-  -i"./addons/sourcemod/scripting/include/" \
-  addons/sourcemod/scripting/mge_logs.sp \
-  -o addons/sourcemod/plugins/mge_logs.smx
+  -i"./scripting/include/" \
+  scripting/mge_logs.sp \
+  -o plugins/mge_logs.smx
 ```
 
-CI ([`.github/workflows/build.yml`](.github/workflows/build.yml)) compiles and attaches the `.smx` to GitHub releases on every `v*` tag. The compiled plugin is also committed at [`addons/sourcemod/plugins/mge_logs.smx`](addons/sourcemod/plugins/mge_logs.smx) for convenience — pull a tagged release if you want a build that matches CI exactly.
+CI ([`.github/workflows/build.yml`](.github/workflows/build.yml)) compiles and attaches a zip (`plugins/`, `scripting/`, `translations/`) to GitHub releases on every `v*` tag.
 
 ## Third-party code
 

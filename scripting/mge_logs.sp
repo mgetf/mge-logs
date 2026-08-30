@@ -5,8 +5,9 @@
 #include <tf2_stocks>
 #include <mge>
 #include <ripext>
+#include <morecolors>
 
-#define PLUGIN_VERSION "0.2"
+#define PLUGIN_VERSION "0.3"
 
 #define MAX_ARENAS 64
 #define MAX_SESSION_PLAYERS 4
@@ -68,6 +69,8 @@ static char s_UploadLogBuf[MAX_UPLOAD_LOG_SIZE];
 
 public void OnPluginStart()
 {
+	LoadTranslations("mge_logs.phrases");
+
 	g_cvEnabled   = CreateConVar("mge_logs_enabled",    "1",  "Master switch for match logging.", _, true, 0.0, true, 1.0);
 	g_cvMaxFiles  = CreateConVar("mge_logs_max_files",  "1000", "Max log files to keep in logs/mge/.", _, true, 0.0);
 	g_cvUpload    = CreateConVar("mge_logs_upload",     "0",  "Upload completed logs to the mge.tf backend.", _, true, 0.0, true, 1.0);
@@ -86,7 +89,7 @@ public void OnPluginStart()
 	if (g_cvHostname != null)
 		g_cvHostname.AddChangeHook(OnUploadConVarChanged);
 
-	RegConsoleCmd("sm_lastlog", Cmd_LastLog);
+	RegConsoleCmd("sm_log", Cmd_ShowLog);
 	AddCommandListener(Listener_Say, "say");
 	AddCommandListener(Listener_Say, "say_team");
 
@@ -131,6 +134,11 @@ public void OnLibraryRemoved(const char[] name)
 		g_bMGEAvailable = false;
 		DestroyAllSessions();
 	}
+}
+
+public void OnClientPutInServer(int client)
+{
+	g_sLastLogUrl[client][0] = '\0';
 }
 
 public void OnClientDisconnected(int client)
@@ -700,7 +708,7 @@ bool ReadLogFile(const char[] path, char[] buffer, int maxlen)
 	return true;
 }
 
-void NotifyArenaPlayers(int arena, const char[] message)
+void NotifyArenaPlayers(int arena, const char[] phrase)
 {
 	for (int i = 0; i < g_iSessionPlayerCount[arena]; i++) {
 		if (g_sSessionPlayers[arena][i][0] == '\0') {
@@ -716,7 +724,7 @@ void NotifyArenaPlayers(int arena, const char[] message)
 			if (GetClientAuthId(client, AuthId_Steam3, clientSteamId, sizeof(clientSteamId))
 				&& StrEqual(clientSteamId, g_sSessionPlayers[arena][i]))
 			{
-				PrintToChat(client, "%s", message);
+				MC_PrintToChat(client, "%t", phrase);
 			}
 		}
 	}
@@ -736,7 +744,7 @@ void UploadSession(int arena, const char[] filePath)
 		return;
 	}
 
-	NotifyArenaPlayers(arena, "[MGE] Uploading match log...");
+	NotifyArenaPlayers(arena, "LogUploading");
 
 	DataPack pack = new DataPack();
 	pack.WriteString(filePath);
@@ -808,7 +816,7 @@ void DoStoreUrlFromPack(DataPack pack, const char[] logUrl)
 			if (GetClientAuthId(client, AuthId_Steam3, clientSteamId, sizeof(clientSteamId))
 				&& StrEqual(clientSteamId, steamId))
 			{
-				PrintToChat(client, "[MGE] Log uploaded! %s", logUrl);
+				MC_PrintToChat(client, "%t", "LogUploaded", logUrl);
 			}
 		}
 	}
@@ -840,7 +848,7 @@ void NotifyPlayersOfError(DataPack pack, const char[] errorMsg)
 			if (GetClientAuthId(client, AuthId_Steam3, clientSteamId, sizeof(clientSteamId))
 				&& StrEqual(clientSteamId, steamId))
 			{
-				PrintToChat(client, "[MGE] Log upload failed: %s", errorMsg);
+				MC_PrintToChat(client, "%t", "LogUploadFailed", errorMsg);
 			}
 		}
 	}
@@ -957,7 +965,7 @@ public void Upload_RetryComplete(HTTPResponse response, DataPack pack, const cha
 	delete pack;
 }
 
-public Action Cmd_LastLog(int client, int args)
+public Action Cmd_ShowLog(int client, int args)
 {
 	if (client == 0) {
 		return Plugin_Handled;
@@ -965,6 +973,11 @@ public Action Cmd_LastLog(int client, int args)
 
 	ShowLastLog(client);
 	return Plugin_Handled;
+}
+
+bool IsLogChatTrigger(const char[] text)
+{
+	return StrEqual(text, "!log") || StrEqual(text, ".log") || StrEqual(text, "/log");
 }
 
 public Action Listener_Say(int client, const char[] command, int argc)
@@ -976,7 +989,7 @@ public Action Listener_Say(int client, const char[] command, int argc)
 	char text[32];
 	GetCmdArg(1, text, sizeof(text));
 
-	if (!StrEqual(text, "!lastlog") && !StrEqual(text, ".lastlog")) {
+	if (!IsLogChatTrigger(text)) {
 		return Plugin_Continue;
 	}
 
@@ -992,7 +1005,7 @@ public Action Listener_Say(int client, const char[] command, int argc)
 void ShowLastLog(int client)
 {
 	if (g_sLastLogUrl[client][0] == '\0') {
-		PrintToChat(client, "[MGE] No recent log found.");
+		MC_PrintToChat(client, "%t", "NoMatchesPlayed");
 		return;
 	}
 
@@ -1006,7 +1019,8 @@ public void QueryConVar_HtmlMotd(QueryCookie cookie, int client, ConVarQueryResu
 	}
 
 	if (result == ConVarQuery_Okay && StringToInt(cvarValue) != 0) {
-		PrintToChat(client, "[MGE] Last log: %s", g_sLastLogUrl[client]);
+		MC_PrintToChat(client, "%t", "LogUrl", g_sLastLogUrl[client]);
+		MC_PrintToChat(client, "%t", "EnableHtmlMotd");
 		return;
 	}
 

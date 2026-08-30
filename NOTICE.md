@@ -1,7 +1,7 @@
 # Third-Party Notices
 
 This project vendors the following third-party SourcePawn includes under
-`addons/sourcemod/scripting/include/` so the plugin can be compiled standalone.
+`scripting/include/` so the plugin can be compiled standalone.
 They are not original work of this project and retain their own licenses.
 
 ## mge.inc

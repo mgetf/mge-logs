@@ -22,15 +22,17 @@ jobs:
 
       - name: Compile
         run: |
+          mkdir -p plugins
           spcomp \
-            -i"./addons/sourcemod/scripting/include/" \
-            addons/sourcemod/scripting/mge_logs.sp \
-            -o addons/sourcemod/plugins/mge_logs.smx
+            -i"./scripting/include/" \
+            scripting/mge_logs.sp \
+            -o plugins/mge_logs.smx
+          test -s plugins/mge_logs.smx
 
       - name: Package
         run: |
           mkdir build
-          7za a -r build/mge_logs.zip addons/
+          7za a -r build/mge_logs.zip plugins/ scripting/ translations/
 
       - name: Release
         uses: softprops/action-gh-release@v1
