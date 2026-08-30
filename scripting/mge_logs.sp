@@ -7,7 +7,7 @@
 #include <ripext>
 #include <morecolors>
 
-#define PLUGIN_VERSION "0.3"
+#define PLUGIN_VERSION "0.4"
 
 #define MAX_ARENAS 64
 #define MAX_SESSION_PLAYERS 4
@@ -62,6 +62,8 @@ int g_iSessionPlayerCount[MAX_ARENAS];
 int g_iSessionWinnerScore[MAX_ARENAS];
 int g_iSessionLoserScore[MAX_ARENAS];
 int g_iSession2v2WinningTeam[MAX_ARENAS];
+int g_iSessionRedScore[MAX_ARENAS];
+int g_iSessionBluScore[MAX_ARENAS];
 
 char g_sLastLogUrl[MAXPLAYERS + 1][MAX_LAST_LOG_URL_LEN];
 
@@ -211,6 +213,16 @@ public void MGE_On2v2MatchEnd(int arena_index, int winning_team, int winning_sco
 
 	g_bSessionPendingFlush[arena_index] = true;
 	RequestFrame(Frame_FlushPendingSessions, arena_index);
+}
+
+public void MGE_OnArenaScoreChange(int arena_index, int red_score, int blu_score)
+{
+	if (!IsValidArenaIndex(arena_index) || !g_bSessionActive[arena_index]) {
+		return;
+	}
+
+	g_iSessionRedScore[arena_index] = red_score;
+	g_iSessionBluScore[arena_index] = blu_score;
 }
 
 public void MGE_OnPlayerArenaRemoved(int client, int arena_index)
@@ -375,6 +387,8 @@ void CreateSession(int arena, int player1, int player2, int player3 = -1, int pl
 	g_bSessionActive[arena] = true;
 	g_bSession2v2[arena] = is2v2;
 	g_iSessionPlayerCount[arena] = playerCount;
+	g_iSessionRedScore[arena] = 0;
+	g_iSessionBluScore[arena] = 0;
 
 	for (int i = 0; i < playerCount; i++) {
 		strcopy(g_sSessionPlayers[arena][i], MAX_STEAMID_LEN, steamIds[i]);
@@ -437,6 +451,8 @@ void DestroySession(int arena)
 	g_iSessionLoserScore[arena] = 0;
 	g_bSession2v2[arena] = false;
 	g_iSession2v2WinningTeam[arena] = 0;
+	g_iSessionRedScore[arena] = 0;
+	g_iSessionBluScore[arena] = 0;
 }
 
 void AbortSession(int arena, const char[] reason)
@@ -446,13 +462,16 @@ void AbortSession(int arena, const char[] reason)
 	}
 
 	AppendMetaLine(arena,
-		"World triggered \"mge_match_aborted\" (reason \"%s\")", reason);
+		"World triggered \"mge_match_aborted\" (reason \"%s\") (red_score \"%d\") (blu_score \"%d\")",
+		reason, g_iSessionRedScore[arena], g_iSessionBluScore[arena]);
 
 	char filePath[PLATFORM_MAX_PATH];
 	BuildPath(Path_SM, filePath, sizeof(filePath),
 		"logs/mge/mge_%s_incomplete.log", g_sSessionMatchId[arena]);
 
-	if (FlushSession(arena, "_incomplete")) {
+	bool skipUpload = (g_iSessionRedScore[arena] == 0 && g_iSessionBluScore[arena] == 0);
+
+	if (FlushSession(arena, "_incomplete") && !skipUpload) {
 		UploadSession(arena, filePath);
 	}
 	DestroySession(arena);
