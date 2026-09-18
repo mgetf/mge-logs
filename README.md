@@ -12,6 +12,7 @@ See [`docs/rfc-001-mge-match-logging.md`](docs/rfc-001-mge-match-logging.md) for
 - **Enrichment** — Relies on existing community plugins (`supstats2`, `medicstats`) that already emit rich per-event log lines (damage, accuracy, airshots, uber tracking) unconditionally via `AddGameLogHook()`. `mge_logs` does not duplicate this logic — it only captures and routes the lines.
 - **Collection** — Buffers lines per active arena session and writes one `.log` file per match to `logs/mge/mge_<matchid>.log` (or `..._incomplete.log` if the match was aborted by disconnect, map change, or plugin unload).
 - **Upload (optional)** — If `mge_logs_upload` is enabled and an API key/URL are configured, the completed log is POSTed to the mge.tf backend via [sm-ripext](https://github.com/ErasedDeath/sm-ripext), and the returned URL is available in-game via `!log`.
+- **Upload tracking** — Every log picked for upload gets a row in a local SQLite database (`addons/sourcemod/data/sqlite/sourcemod-local.sq3`, table `mge_logs_uploads`) with its match ID, file path, and upload status. A periodic sweep retries anything still missing a URL, so a backend outage, a rotated API key, or a server restart doesn't strand a log permanently. File retention (`mge_logs_max_files`) never deletes a log that hasn't uploaded successfully yet.
 
 ## Dependencies
 
@@ -36,6 +37,8 @@ See [`docs/rfc-001-mge-match-logging.md`](docs/rfc-001-mge-match-logging.md) for
 | `mge_logs_upload` | `0` | Upload completed logs to the mge.tf backend |
 | `mge_logs_apikey` | *(empty)* | API key for log upload (protected ConVar, never printed) |
 | `mge_logs_upload_url` | *(empty)* | Full endpoint URL for log upload (e.g. `https://mge.tf/api/logs/upload`) |
+| `mge_logs_resync_interval` | `300.0` | Seconds between sweeps that retry uploads still missing a URL (`0` disables the sweep) |
+| `mge_logs_resync_max_attempts` | `50` | Max upload attempts (immediate + retry + resync sweeps) before a log is abandoned |
 
 ## In-game commands
 

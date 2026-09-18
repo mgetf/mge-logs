@@ -7,7 +7,7 @@
 #include <ripext>
 #include <morecolors>
 
-#define PLUGIN_VERSION "0.4"
+#define PLUGIN_VERSION "0.5"
 
 #define MAX_ARENAS 64
 #define MAX_SESSION_PLAYERS 4
@@ -18,6 +18,9 @@
 #define MAX_LAST_LOG_URL_LEN 256
 #define MAX_HOSTNAME_LEN 128
 #define MAX_AUTH_HEADER_LEN 160
+#define UPLOADS_DB_NAME "sourcemod-local"
+#define UPLOADS_TABLE "mge_logs_uploads"
+#define MAX_RESYNC_BATCH_SIZE 20
 
 static const char g_sClassNames[10][] = {
 	"", "scout", "sniper", "soldier", "demoman",
@@ -38,6 +41,11 @@ ConVar g_cvUpload;
 ConVar g_cvApiKey;
 ConVar g_cvUploadUrl;
 ConVar g_cvHostname;
+ConVar g_cvResyncInterval;
+ConVar g_cvResyncMaxAttempts;
+
+Database g_hDB;
+Handle g_hResyncTimer;
 
 char g_sApiKey[128];
 char g_sUploadUrl[256];
@@ -78,6 +86,8 @@ public void OnPluginStart()
 	g_cvUpload    = CreateConVar("mge_logs_upload",     "0",  "Upload completed logs to the mge.tf backend.", _, true, 0.0, true, 1.0);
 	g_cvApiKey    = CreateConVar("mge_logs_apikey",     "",   "API key for log upload.", FCVAR_PROTECTED);
 	g_cvUploadUrl = CreateConVar("mge_logs_upload_url", "",   "Full endpoint URL for log upload (e.g. https://mge.tf/api/logs/upload).");
+	g_cvResyncInterval    = CreateConVar("mge_logs_resync_interval", "300.0", "Seconds between sweeps that retry uploads still missing a URL (0 disables the sweep).", _, true, 0.0);
+	g_cvResyncMaxAttempts = CreateConVar("mge_logs_resync_max_attempts", "50", "Max upload attempts (immediate + retry + resync sweeps) before a log is abandoned.", _, true, 1.0);
 
 	g_cvHostname = FindConVar("hostname");
 
@@ -90,6 +100,7 @@ public void OnPluginStart()
 	g_cvUploadUrl.AddChangeHook(OnUploadConVarChanged);
 	if (g_cvHostname != null)
 		g_cvHostname.AddChangeHook(OnUploadConVarChanged);
+	g_cvResyncInterval.AddChangeHook(OnResyncIntervalChanged);
 
 	RegConsoleCmd("sm_log", Cmd_ShowLog);
 	AddCommandListener(Listener_Say, "say");
@@ -103,6 +114,9 @@ public void OnPluginStart()
 
 	AddGameLogHook(GameLog);
 	g_bGameLogHooked = true;
+
+	ConnectUploadsDatabase();
+	StartResyncTimer();
 }
 
 public void OnPluginEnd()
@@ -113,6 +127,9 @@ public void OnPluginEnd()
 	}
 
 	AbortAllSessions("plugin_unload");
+
+	delete g_hResyncTimer;
+	delete g_hDB;
 
 	delete g_hSteamToArena;
 	g_hSteamToArena = null;
@@ -156,6 +173,298 @@ public void OnUploadConVarChanged(ConVar convar, const char[] oldValue, const ch
 		strcopy(g_sUploadUrl, sizeof(g_sUploadUrl), newValue);
 	else if (convar == g_cvHostname)
 		strcopy(g_sHostname, sizeof(g_sHostname), newValue);
+}
+
+public void OnResyncIntervalChanged(ConVar convar, const char[] oldValue, const char[] newValue)
+{
+	StartResyncTimer();
+}
+
+// ===== Local SQLite upload tracking =====
+//
+// The DB is the source of truth for "did this log ever make it to the backend". A row is
+// written the moment we decide a log is worth uploading (UploadSession), url stays NULL
+// until a POST actually succeeds, and a periodic sweep (Timer_ResyncPendingUploads) retries
+// anything still NULL so a backend outage or a restart doesn't strand logs forever.
+
+void ConnectUploadsDatabase()
+{
+	char error[256];
+	g_hDB = SQLite_UseDatabase(UPLOADS_DB_NAME, error, sizeof(error));
+	if (g_hDB == null) {
+		LogError("[mge_logs] Could not open local SQLite database '%s': %s", UPLOADS_DB_NAME, error);
+		return;
+	}
+
+	g_hDB.Query(SqlCallback_TableCreated,
+		"CREATE TABLE IF NOT EXISTS " ... UPLOADS_TABLE ... " ("
+		... "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+		... "matchid TEXT UNIQUE NOT NULL, "
+		... "filepath TEXT NOT NULL, "
+		... "url TEXT, "
+		... "missing INTEGER NOT NULL DEFAULT 0, "
+		... "attempts INTEGER NOT NULL DEFAULT 0, "
+		... "created_at INTEGER NOT NULL, "
+		... "last_attempt_at INTEGER"
+		... ")");
+}
+
+public void SqlCallback_TableCreated(Database db, DBResultSet results, const char[] error, any data)
+{
+	if (error[0] != '\0') {
+		LogError("[mge_logs] Failed to create %s table: %s", UPLOADS_TABLE, error);
+	}
+}
+
+// Fire-and-forget callback for INSERT/UPDATE queries where we only care about logging failures.
+public void SqlCallback_Generic(Database db, DBResultSet results, const char[] error, any data)
+{
+	if (error[0] != '\0') {
+		LogError("[mge_logs] SQLite query failed: %s", error);
+	}
+}
+
+void RecordPendingUpload(const char[] matchId, const char[] filePath)
+{
+	if (g_hDB == null) {
+		return;
+	}
+
+	char query[1024];
+	g_hDB.Format(query, sizeof(query),
+		"INSERT OR IGNORE INTO " ... UPLOADS_TABLE ... " (matchid, filepath, created_at) VALUES ('%s', '%s', %d)",
+		matchId, filePath, GetTime());
+	g_hDB.Query(SqlCallback_Generic, query);
+}
+
+void MarkUploadSucceeded(const char[] matchId, const char[] logUrl)
+{
+	if (g_hDB == null) {
+		return;
+	}
+
+	char query[1024];
+	g_hDB.Format(query, sizeof(query),
+		"UPDATE " ... UPLOADS_TABLE ... " SET url = '%s', attempts = attempts + 1, last_attempt_at = %d WHERE matchid = '%s'",
+		logUrl, GetTime(), matchId);
+	g_hDB.Query(SqlCallback_Generic, query);
+}
+
+void MarkUploadAttemptFailed(const char[] matchId)
+{
+	if (g_hDB == null) {
+		return;
+	}
+
+	char query[512];
+	g_hDB.Format(query, sizeof(query),
+		"UPDATE " ... UPLOADS_TABLE ... " SET attempts = attempts + 1, last_attempt_at = %d WHERE matchid = '%s'",
+		GetTime(), matchId);
+	g_hDB.Query(SqlCallback_Generic, query);
+}
+
+void MarkUploadMissing(const char[] matchId)
+{
+	if (g_hDB == null) {
+		return;
+	}
+
+	char query[512];
+	g_hDB.Format(query, sizeof(query),
+		"UPDATE " ... UPLOADS_TABLE ... " SET missing = 1 WHERE matchid = '%s'", matchId);
+	g_hDB.Query(SqlCallback_Generic, query);
+	LogError("[mge_logs] Log file for match %s is missing on disk; giving up on upload", matchId);
+}
+
+// Reads matchid back out of the DataPack built by UploadSession/Timer_RetryUpload without
+// disturbing callers that reset+re-read the same pack afterwards.
+void ReadMatchIdFromPack(DataPack pack, char[] buffer, int maxlen)
+{
+	char skipBuf[PLATFORM_MAX_PATH];
+	pack.Reset();
+	pack.ReadString(skipBuf, sizeof(skipBuf)); // filePath
+	pack.ReadString(skipBuf, sizeof(skipBuf)); // apiKey
+	pack.ReadString(skipBuf, sizeof(skipBuf)); // uploadUrl
+	pack.ReadString(buffer, maxlen);           // matchId
+}
+
+void StartResyncTimer()
+{
+	delete g_hResyncTimer;
+
+	float interval = g_cvResyncInterval.FloatValue;
+	if (interval <= 0.0) {
+		return;
+	}
+
+	g_hResyncTimer = CreateTimer(interval, Timer_ResyncPendingUploads, _, TIMER_REPEAT);
+}
+
+public Action Timer_ResyncPendingUploads(Handle timer)
+{
+	if (g_hDB == null || !g_cvUpload.BoolValue) {
+		return Plugin_Continue;
+	}
+
+	int maxAttempts = g_cvResyncMaxAttempts.IntValue;
+
+	char query[256];
+	g_hDB.Format(query, sizeof(query),
+		"SELECT matchid, filepath FROM " ... UPLOADS_TABLE ... " WHERE url IS NULL AND missing = 0 AND attempts < %d ORDER BY id ASC LIMIT %d",
+		maxAttempts, MAX_RESYNC_BATCH_SIZE);
+	g_hDB.Query(SqlCallback_ResyncRows, query);
+
+	g_hDB.Format(query, sizeof(query),
+		"SELECT COUNT(*) FROM " ... UPLOADS_TABLE ... " WHERE url IS NULL AND missing = 0 AND attempts >= %d",
+		maxAttempts);
+	g_hDB.Query(SqlCallback_AbandonedCount, query);
+
+	return Plugin_Continue;
+}
+
+public void SqlCallback_ResyncRows(Database db, DBResultSet results, const char[] error, any data)
+{
+	if (results == null) {
+		LogError("[mge_logs] Resync sweep query failed: %s", error);
+		return;
+	}
+
+	char matchId[MATCH_ID_LEN];
+	char filePath[PLATFORM_MAX_PATH];
+
+	while (results.FetchRow()) {
+		results.FetchString(0, matchId, sizeof(matchId));
+		results.FetchString(1, filePath, sizeof(filePath));
+		RetryUploadFromDisk(matchId, filePath);
+	}
+}
+
+public void SqlCallback_AbandonedCount(Database db, DBResultSet results, const char[] error, any data)
+{
+	if (results == null || !results.FetchRow()) {
+		return;
+	}
+
+	int count = results.FetchInt(0);
+	if (count > 0) {
+		LogError("[mge_logs] %d log(s) abandoned after reaching mge_logs_resync_max_attempts", count);
+	}
+}
+
+void RetryUploadFromDisk(const char[] matchId, const char[] filePath)
+{
+	if (!FileExists(filePath)) {
+		MarkUploadMissing(matchId);
+		return;
+	}
+
+	if (!g_cvUpload.BoolValue || !LibraryExists("ripext")) {
+		return;
+	}
+
+	if (g_sApiKey[0] == '\0' || g_sUploadUrl[0] == '\0') {
+		return;
+	}
+
+	if (!ReadLogFile(filePath, s_UploadLogBuf, sizeof(s_UploadLogBuf))) {
+		LogError("[mge_logs] Resync: could not re-read log file %s", filePath);
+		return;
+	}
+
+	DataPack pack = new DataPack();
+	pack.WriteString(matchId);
+
+	char authHeader[MAX_AUTH_HEADER_LEN];
+	FormatEx(authHeader, sizeof(authHeader), "Bearer %s", g_sApiKey);
+
+	JSONObject payload = new JSONObject();
+	payload.SetString("matchid", matchId);
+	payload.SetString("log", s_UploadLogBuf);
+	if (g_sHostname[0] != '\0') {
+		payload.SetString("hostname", g_sHostname);
+	}
+
+	HTTPRequest request = new HTTPRequest(g_sUploadUrl);
+	request.SetHeader("Authorization", authHeader);
+	request.Post(payload, Upload_ResyncComplete, pack);
+	delete payload;
+}
+
+public void Upload_ResyncComplete(HTTPResponse response, DataPack pack, const char[] error)
+{
+	pack.Reset();
+	char matchId[MATCH_ID_LEN];
+	pack.ReadString(matchId, sizeof(matchId));
+
+	if (response.Status != HTTPStatus_OK) {
+		LogError("[mge_logs] Resync upload failed for %s (HTTP %d): %s", matchId, view_as<int>(response.Status), error);
+		MarkUploadAttemptFailed(matchId);
+		delete pack;
+		return;
+	}
+
+	JSONObject json = view_as<JSONObject>(response.Data);
+	char logUrl[MAX_LAST_LOG_URL_LEN];
+
+	if (json == null || !json.GetString("url", logUrl, sizeof(logUrl))) {
+		LogError("[mge_logs] Resync upload response missing 'url' field for %s", matchId);
+		MarkUploadAttemptFailed(matchId);
+		delete pack;
+		return;
+	}
+
+	MarkUploadSucceeded(matchId, logUrl);
+	delete pack;
+}
+
+// Synchronous on purpose: called at most once per match end/abort (never per-frame), and we
+// need the result before deciding which files EnforceFileRetention is allowed to delete.
+// Mixing sync SQL_Query with the async g_hDB.Query() calls above requires the lock/unlock
+// pair below - see the SQL_LockDatabase doc in dbi.inc.
+ArrayList GetPendingUploadFilePaths()
+{
+	if (g_hDB == null) {
+		return null;
+	}
+
+	SQL_LockDatabase(g_hDB);
+
+	ArrayList list = null;
+	DBResultSet results = SQL_Query(g_hDB, "SELECT filepath FROM " ... UPLOADS_TABLE ... " WHERE url IS NULL AND missing = 0");
+	if (results != null) {
+		list = new ArrayList(ByteCountToCells(PLATFORM_MAX_PATH));
+		char path[PLATFORM_MAX_PATH];
+		while (results.FetchRow()) {
+			results.FetchString(0, path, sizeof(path));
+			list.PushString(path);
+		}
+		delete results;
+	}
+
+	SQL_UnlockDatabase(g_hDB);
+
+	return list;
+}
+
+bool IsFileNamePending(ArrayList pendingPaths, const char[] fileName)
+{
+	if (pendingPaths == null) {
+		return false;
+	}
+
+	int nameLen = strlen(fileName);
+	char stored[PLATFORM_MAX_PATH];
+
+	int count = pendingPaths.Length;
+	for (int i = 0; i < count; i++) {
+		pendingPaths.GetString(i, stored, sizeof(stored));
+		int storedLen = strlen(stored);
+		if (storedLen >= nameLen && StrEqual(stored[storedLen - nameLen], fileName)) {
+			return true;
+		}
+	}
+
+	return false;
 }
 
 public void MGE_On1v1MatchStart(int arena_index, int player1, int player2)
@@ -465,15 +774,17 @@ void AbortSession(int arena, const char[] reason)
 		"World triggered \"mge_match_aborted\" (reason \"%s\") (red_score \"%d\") (blu_score \"%d\")",
 		reason, g_iSessionRedScore[arena], g_iSessionBluScore[arena]);
 
-	char filePath[PLATFORM_MAX_PATH];
-	BuildPath(Path_SM, filePath, sizeof(filePath),
-		"logs/mge/mge_%s_incomplete.log", g_sSessionMatchId[arena]);
-
-	bool skipUpload = (g_iSessionRedScore[arena] == 0 && g_iSessionBluScore[arena] == 0);
-
-	if (FlushSession(arena, "_incomplete") && !skipUpload) {
-		UploadSession(arena, filePath);
-	}
+	// AbortSession never uploads. Every path that reaches it is a match MGEMod itself never
+	// scores: MGEMod's RemoveFromQueue() always resolves ShouldForfeitOnLeave()/ProcessMatchForfeit()
+	// (which fires MGE_On1v1MatchEnd/MGE_On2v2MatchEnd) BEFORE firing MGE_OnPlayerArenaRemoved, in
+	// the same synchronous call - so if a disconnect forfeit actually counted, g_bSessionPendingFlush
+	// is already true by the time we'd get here and MGE_OnPlayerArenaRemoved's handler returns early
+	// instead of calling us. A map change never runs MGEMod's forfeit logic at all (OnMapEnd just
+	// kills timers), so a map-interrupted match is never recorded regardless of score. A plugin
+	// unload leaves MGEMod's own match state untouched, so the eventual outcome is unknowable to us.
+	// None of the three reasons this gets called ever correspond to a stats-worthy result - keep the
+	// local .log file for manual debugging, but never upload it.
+	FlushSession(arena, "_incomplete");
 	DestroySession(arena);
 }
 
@@ -672,14 +983,27 @@ void EnforceFileRetention()
 	if (fileCount > maxFiles) {
 		SortADTArray(files, Sort_Ascending, Sort_String);
 
+		// Never delete a log that hasn't uploaded successfully yet - the resync sweep
+		// still needs the file on disk to retry it.
+		ArrayList pendingPaths = GetPendingUploadFilePaths();
+
 		int toDelete = fileCount - maxFiles;
 		char fullPath[PLATFORM_MAX_PATH];
+		int deleted = 0;
 
-		for (int i = 0; i < toDelete; i++) {
+		for (int i = 0; i < files.Length && deleted < toDelete; i++) {
 			files.GetString(i, entry, sizeof(entry));
+
+			if (IsFileNamePending(pendingPaths, entry)) {
+				continue;
+			}
+
 			FormatEx(fullPath, sizeof(fullPath), "%s/%s", g_sLogDir, entry);
 			DeleteFile(fullPath);
+			deleted++;
 		}
+
+		delete pendingPaths;
 	}
 
 	delete files;
@@ -751,6 +1075,11 @@ void NotifyArenaPlayers(int arena, const char[] phrase)
 
 void UploadSession(int arena, const char[] filePath)
 {
+	// Record the log as pending before any of the early returns below, so a log written
+	// while uploads are disabled (or ripext/apikey/url aren't configured yet) still gets
+	// picked up later by the resync sweep once things are fixed.
+	RecordPendingUpload(g_sSessionMatchId[arena], filePath);
+
 	if (!g_cvUpload.BoolValue || !LibraryExists("ripext")) {
 		return;
 	}
@@ -875,8 +1204,12 @@ void NotifyPlayersOfError(DataPack pack, const char[] errorMsg)
 
 public void Upload_Complete(HTTPResponse response, DataPack pack, const char[] error)
 {
+	char matchId[MATCH_ID_LEN];
+	ReadMatchIdFromPack(pack, matchId, sizeof(matchId));
+
 	if (response.Status != HTTPStatus_OK) {
 		int statusCode = view_as<int>(response.Status);
+		MarkUploadAttemptFailed(matchId);
 
 		if (statusCode >= 400 && statusCode < 500) {
 			char errorMsg[256];
@@ -904,10 +1237,12 @@ public void Upload_Complete(HTTPResponse response, DataPack pack, const char[] e
 
 	if (!json.GetString("url", logUrl, sizeof(logUrl))) {
 		LogError("[mge_logs] Upload response missing 'url' field");
+		MarkUploadAttemptFailed(matchId);
 		delete pack;
 		return;
 	}
 
+	MarkUploadSucceeded(matchId, logUrl);
 	DoStoreUrlFromPack(pack, logUrl);
 	delete pack;
 }
@@ -949,8 +1284,12 @@ public Action Timer_RetryUpload(Handle timer, DataPack pack)
 
 public void Upload_RetryComplete(HTTPResponse response, DataPack pack, const char[] error)
 {
+	char matchId[MATCH_ID_LEN];
+	ReadMatchIdFromPack(pack, matchId, sizeof(matchId));
+
 	if (response.Status != HTTPStatus_OK) {
 		int statusCode = view_as<int>(response.Status);
+		MarkUploadAttemptFailed(matchId);
 
 		if (statusCode >= 400 && statusCode < 500) {
 			char errorMsg[256];
@@ -976,10 +1315,12 @@ public void Upload_RetryComplete(HTTPResponse response, DataPack pack, const cha
 
 	if (!json.GetString("url", logUrl, sizeof(logUrl))) {
 		LogError("[mge_logs] Upload retry response missing 'url' field");
+		MarkUploadAttemptFailed(matchId);
 		delete pack;
 		return;
 	}
 
+	MarkUploadSucceeded(matchId, logUrl);
 	DoStoreUrlFromPack(pack, logUrl);
 	delete pack;
 }

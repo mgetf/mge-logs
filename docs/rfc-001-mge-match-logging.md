@@ -82,10 +82,12 @@ This is `mge_logs`, the plugin we build. It uses `mge.inc` forwards to know *whe
 │             LIFECYCLE LAYER ("when/where/who/result")        │
 │                                                             │
 │  MGE plugin (mge.inc) provides:                             │
-│    MGE_On1v1MatchStart → open session                       │
-│    MGE_On1v1MatchEnd   → close session, write file          │
-│    MGE_On2v2MatchStart → open session                       │
-│    MGE_On2v2MatchEnd   → close session, write file          │
+│    MGE_On1v1MatchStart → open session (or resume if paused) │
+│    MGE_On1v1MatchEnd   → close session, write one file      │
+│    MGE_On2v2MatchStart → open session (or resume if paused) │
+│    MGE_On2v2MatchEnd   → close session, write one file      │
+│    MGE_OnDuelPaused    → keep session, stop routing         │
+│    MGE_OnDuelResumed   → same matchid, route again          │
 │    MGE_OnPlayerELOChange → append ELO metadata              │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -119,12 +121,14 @@ Both plugins depend on `match.inc` at compile time, which hooks tournament mode 
 
 | MGE Forward | mge_logs Response |
 |---|---|
-| `MGE_On1v1MatchStart(arena, p1, p2)` | Create a LogSession for the arena with p1 and p2's SteamIDs |
-| `MGE_On2v2MatchStart(arena, t1p1, t1p2, t2p1, t2p2)` | Create a LogSession with all four SteamIDs |
-| `MGE_On1v1MatchEnd(arena, winner, loser, w_score, l_score)` | Finalize and flush the session to disk |
-| `MGE_On2v2MatchEnd(arena, w_team, w_score, l_score, ...)` | Finalize and flush the session to disk |
+| `MGE_On1v1MatchStart(arena, p1, p2)` | If this arena already has a **paused** session: resume it (same `matchid`). Else create a LogSession for the arena with p1 and p2's SteamIDs |
+| `MGE_On2v2MatchStart(arena, …)` | Same: resume paused session or create |
+| `MGE_On1v1MatchEnd` / `MGE_On2v2MatchEnd` | Finalize and flush **one** file. Do this even if the session was paused earlier |
+| `MGE_OnDuelPaused(arena)` | **Keep the session.** Append `mge_match_paused`. Stop routing combat lines. Do **not** abort, do **not** upload |
+| `MGE_OnDuelResumed(arena)` | Append `mge_match_resumed`. Same `matchid`. Resume routing |
 | `MGE_OnArenaPlayerDeath(victim, attacker, arena)` | (Optional) Increment internal kill counter for validation |
 | `MGE_OnPlayerELOChange(client, old, new, arena)` | Append ELO delta to session metadata |
+| `MGE_OnPlayerArenaRemoved` of a session player | **Public (not managed):** abort as today (`mge_match_aborted`, `_incomplete.log`). **Managed / already paused:** do nothing — the pause path owns this |
 
 ### 5.2 Log Line Routing
 
@@ -179,7 +183,32 @@ Each active arena session maintains:
 
 On match end, the buffer is flushed to disk and all session state is freed. Sessions are keyed by arena index; since an arena can only have one active match at a time, there's no collision.
 
+**Pause is still the same session.** Do not free the buffer on disconnect when the arena is managed or `MGE_OnDuelPaused` already fired. A later MatchStart on that arena must not allocate a second `matchid`.
+
 Maximum concurrent sessions equals the number of arenas on the map (typically 10-20). Memory overhead is minimal — an MGE match generates far fewer log lines than a 30-minute 6v6 match.
+
+### 5.6 Pause and resume (managed fights)
+
+Public MGE: a disconnect ends the recording. That stays.
+
+Official / cup / gather fights (any plugin that set `MGE_SetArenaManaged`) must produce **one** log file even if a player drops and comes back. League coordinator RFC: `website-next` `docs/proposals/in-game-match-coordinator.md` (D34).
+
+Required behaviour:
+
+1. MGEMod should fire `MGE_OnDuelPaused` **before** vacating the slot when the arena is managed, so the collector pauses before it sees `OnPlayerArenaRemoved`.
+2. Defence: on participant remove, if `MGE_IsArenaManaged(arena)` or the session is already paused → do **not** abort.
+3. Lines while paused: do not append combat. The remaining player may still shoot at nothing; that is not the match.
+4. `MGE_OnDuelResumed` (or MatchStart while paused): append `mge_match_resumed`, same `matchid`, route again.
+5. Upload once, on real match end (or a true abort: both gone and the director cancelled, map change, plugin unload).
+
+Markers (same `World triggered` convention):
+
+```
+World triggered "mge_match_paused" (reason "player_disconnect")
+World triggered "mge_match_resumed"
+```
+
+Parser contract: one `ParsedMatch`; pause gaps are not combat time; `aborted=false` if the file ends with `mge_match_end`.
 
 ## 6. Game Mode Considerations
 
@@ -251,7 +280,7 @@ These are noted for architectural awareness but are not part of the initial impl
 
 2. **Log line volume** — An MGE server with 20+ players across 10+ arenas will generate more `LogToGame()` calls per second than a typical 6v6 match (more concurrent fights, higher kill rate). supstats2's `OnTakeDamage` hook fires on every hit for every player on the server. Performance impact should be benchmarked. F2's code is performance-conscious (documented in code comments with benchmark data), but the MGE workload pattern differs.
 
-3. **Player disconnect mid-match** — If a player disconnects during a match, MGE fires `MGE_OnPlayerArenaRemoved`. The match may end or be aborted. mge_logs should handle this gracefully — either discard the partial session or flush what it has with a marker indicating the match was incomplete.
+3. **Player disconnect mid-match** — Two paths. **Public:** `MGE_OnPlayerArenaRemoved` of a session player → abort (`mge_match_aborted`, `_incomplete.log`) as today. **Managed:** pause the same session (`mge_match_paused`), wait for resume, one file at real end. Never treat a held official fight as two matches. See §5.6.
 
 4. **Team assignment semantics** — In MGE, both players in a 1v1 are on Red and Blue respectively, but the team assignment is managed by MGE, not by player choice. The `<Team>` field in log lines will reflect the actual TF2 team at the time of the event. This should be consistent within a match but may differ from the `SLOT_ONE`/`SLOT_TWO` semantics in `mge.inc`.
 
